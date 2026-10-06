@@ -1,0 +1,3 @@
+[server]
+# app.py / sec_financials.py를 저장하면 앱을 자동으로 다시 실행합니다.
+runOnSave = true
