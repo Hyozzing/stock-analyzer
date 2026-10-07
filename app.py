@@ -18,12 +18,15 @@ import requests
 import streamlit as st
 
 from sec_financials import (
+    BALANCE_ROUNDING_MAX_ASSET_RATIO,
+    BALANCE_ROUNDING_MAX_UNITS,
     CAPEX_TAGS,
     OPERATING_INCOME_TAGS,
     SEC_USER_AGENT_ENV,
     SecUserAgentMissingError,
     TickerNotFoundError,
     analyze_company,
+    format_amount_auto,
     format_debt_to_equity,
     format_eps,
     format_fcf_growth,
@@ -374,6 +377,23 @@ def render_metric_notes(result: dict, end_dates: list) -> None:
             "메자닌 자본은 Liabilities와 Equity 어느 쪽에도 더하지 않았습니다."
         )
 
+    # 보고 단위 반올림 범위 안의 아주 작은 차이로 PASS (rounding) 처리한 연도를 알립니다.
+    rounding_years = [
+        end for end in end_dates if result["balance_sheet_check"].get(end, {}).get("rounding")
+    ]
+    if rounding_years:
+        notes.append(
+            "A=L+E 검증: "
+            + ", ".join(
+                f"FY{end[:4]} PASS (rounding, diff "
+                f"{format_amount_auto(result['balance_sheet_check'][end]['diff'])})"
+                for end in rounding_years
+            )
+            + " - 재무제표 보고 단위 반올림으로 생길 수 있는 범위(보고 단위 "
+            f"{BALANCE_ROUNDING_MAX_UNITS}단위 이내, 총자산의 "
+            f"{BALANCE_ROUNDING_MAX_ASSET_RATIO * 100:g}% 이내)의 차이라 PASS로 보았습니다."
+        )
+
     # Debt 출처 문구와 같은 작은 캡션으로 한 줄씩 표시합니다.
     for note in notes:
         st.caption(note)
@@ -405,7 +425,7 @@ def render_company(result: dict) -> dict:
     )
     if failed_years:
         lines = "\n".join(
-            f"- FY{end[:4]} ({end}): FAIL (diff: {format_revenue(check['diff'])})"
+            f"- FY{end[:4]} ({end}): FAIL (diff: {format_amount_auto(check['diff'])})"
             for end, check in failed_years
         )
         st.warning(f"등식검증(A=L+E) 실패 회계연도가 있습니다:\n{lines}")

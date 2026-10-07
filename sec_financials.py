@@ -1129,6 +1129,54 @@ def extract_annual_temporary_equity(facts: dict) -> dict:
     return result
 
 
+# 재무등식 반올림 허용 규칙.
+#
+# 회사는 재무상태표를 천 달러/백만 달러 단위로 반올림해 보고하고, 합계 줄도
+# 각각 따로 반올림되므로 원본에 오류가 없어도 A와 L+E가 1~2단위 어긋날 수
+# 있습니다(예: IREN FY2024 10-K 원문은 부채 55,346 + 자본 1,097,471 =
+# 1,152,817인데 "부채와 자본 총계"는 1,152,819로 표기, 단위 $천 → $2,000 차이).
+#
+# 아래 두 조건을 모두 만족할 때만 "PASS (rounding)"으로 판정합니다.
+#   1) |diff| <= 보고 단위 x BALANCE_ROUNDING_MAX_UNITS
+#      보고 단위는 비교한 값들이 모두 나누어떨어지는 가장 큰 단위
+#      ($1M -> $1K -> $1)로 추정합니다.
+#   2) |diff| <= Assets x BALANCE_ROUNDING_MAX_ASSET_RATIO
+#      백만 달러 단위 보고 기업이 1)만으로 최대 $2M까지 허용되지 않도록
+#      회사 규모 대비 상한을 둡니다.
+# 하나라도 넘으면 기존처럼 FAIL입니다. 메자닌 자본 누락(TSLA, $47M~$568M)
+# 같은 의미 있는 차이는 1)에서 걸러집니다.
+BALANCE_ROUNDING_MAX_UNITS = 2
+BALANCE_ROUNDING_MAX_ASSET_RATIO = 0.0001  # 총자산의 0.01%
+REPORTING_UNIT_CANDIDATES = [1_000_000, 1_000, 1]
+
+
+def infer_reporting_unit(values: list) -> int:
+    """값들이 모두 나누어떨어지는 가장 큰 보고 단위($1M, $1K, $1)를 추정합니다."""
+    nonzero_values = [value for value in values if value]
+    for unit in REPORTING_UNIT_CANDIDATES:
+        if all(value % unit == 0 for value in nonzero_values):
+            return unit
+    return 1
+
+
+def _judge_balance_sheet_diff(diff: int, assets_value: int, compared_values: list) -> dict:
+    """
+    diff가 0이면 PASS, 반올림 허용 규칙 안이면 PASS (rounding), 아니면 FAIL로
+    판정합니다. 반올림 PASS인 경우에만 "rounding"과 "reporting_unit"을 담습니다.
+    """
+    if diff == 0:
+        return {"is_valid": True, "diff": diff}
+
+    reporting_unit = infer_reporting_unit(compared_values)
+    within_units = abs(diff) <= reporting_unit * BALANCE_ROUNDING_MAX_UNITS
+    within_ratio = abs(diff) <= abs(assets_value) * BALANCE_ROUNDING_MAX_ASSET_RATIO
+
+    if within_units and within_ratio:
+        return {"is_valid": True, "diff": diff, "rounding": True, "reporting_unit": reporting_unit}
+
+    return {"is_valid": False, "diff": diff}
+
+
 def validate_balance_sheet_equation(
     annual_assets: dict,
     annual_liabilities: dict,
@@ -1140,10 +1188,13 @@ def validate_balance_sheet_equation(
     검증합니다.
 
     Assets/Liabilities/Equity가 모두 존재하는 회계연도 종료일에 대해서만,
-    반올림 전 SEC 원본 정수 값(USD)으로 정확히 비교합니다(임의의 tolerance
-    적용 없음). 반환값은
+    반올림 전 SEC 원본 정수 값(USD)으로 비교합니다. 반환값은
     {회계연도 종료일: {"is_valid": bool, "diff": int}} 형태이며,
-    diff = Assets - (Liabilities + Equity) 입니다(PASS면 0).
+    diff = Assets - (Liabilities + Equity) 입니다.
+
+    diff가 0이 아니어도 보고 단위 반올림으로 설명되는 아주 작은 차이는
+    "PASS (rounding)"으로 판정하고 "rounding": True, "reporting_unit"을 함께
+    담습니다(규칙은 BALANCE_ROUNDING_MAX_UNITS 위 설명 참고).
 
     annual_temporary_equity(extract_annual_temporary_equity의 반환값)에
     메자닌 자본이 보고된 연도는 재무상태표 구조 그대로
@@ -1164,16 +1215,20 @@ def validate_balance_sheet_equation(
         if end_date in annual_temporary_equity:
             temporary_value, temporary_components = annual_temporary_equity[end_date]
             diff = assets_value - (liabilities_value + temporary_value + equity_value)
-            result[end_date] = {
-                "is_valid": diff == 0,
-                "diff": diff,
-                "temporary_equity": temporary_value,
-                "temporary_equity_tags": [tag for tag, _value in temporary_components],
-            }
+            check = _judge_balance_sheet_diff(
+                diff,
+                assets_value,
+                [assets_value, liabilities_value, temporary_value, equity_value],
+            )
+            check["temporary_equity"] = temporary_value
+            check["temporary_equity_tags"] = [tag for tag, _value in temporary_components]
+            result[end_date] = check
             continue
 
         diff = assets_value - (liabilities_value + equity_value)
-        result[end_date] = {"is_valid": diff == 0, "diff": diff}
+        result[end_date] = _judge_balance_sheet_diff(
+            diff, assets_value, [assets_value, liabilities_value, equity_value]
+        )
 
     return result
 
@@ -1467,6 +1522,17 @@ def format_revenue(value: int) -> str:
     return f"${billions:,.2f}B"
 
 
+def format_amount_auto(value: int) -> str:
+    """
+    금액 크기에 맞춰 B(십억)/M(백만)/K(천) 단위를 자동으로 고릅니다.
+    등식검증 diff처럼 작은 값이 $0.00B로 보이지 않게 할 때 씁니다.
+    """
+    for scale, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if abs(value) >= scale:
+            return f"${value / scale:,.2f}{suffix}"
+    return f"${value:,}"
+
+
 def format_eps(value: float) -> str:
     """EPS는 billion 단위로 바꾸지 않고 USD/share 그대로, 소수점 둘째 자리까지 표시합니다."""
     return f"${value:,.2f}"
@@ -1475,18 +1541,21 @@ def format_eps(value: float) -> str:
 def format_balance_check(check) -> str:
     """
     validate_balance_sheet_equation()의 개별 검증 결과를 PASS/FAIL 텍스트로
-    바꿔줍니다. FAIL이면 Assets - (Liabilities + Equity) 차이값(원본 정수를
-    billion 단위로 변환, 소수점 둘째 자리까지)도 함께 표시합니다. Assets/
+    바꿔줍니다. FAIL 또는 PASS (rounding)이면 Assets - (Liabilities + Equity)
+    차이값을 크기에 맞는 B/M/K 단위로 함께 표시합니다. Assets/
     Liabilities/Equity 중 하나라도 없어서 검증하지 못한 연도는 N/A로
     표시합니다.
     """
     if check is None:
         return "[dim]N/A[/dim]"
 
+    if check.get("rounding"):
+        return f"[green]PASS (rounding)[/green] (diff: {format_amount_auto(check['diff'])})"
+
     if check["is_valid"]:
         return "[green]PASS[/green]"
 
-    return f"[bold red]FAIL[/bold red] (diff: {format_revenue(check['diff'])})"
+    return f"[bold red]FAIL[/bold red] (diff: {format_amount_auto(check['diff'])})"
 
 
 def format_percent(value, show_sign: bool = False) -> str:
